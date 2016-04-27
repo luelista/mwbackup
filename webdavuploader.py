@@ -18,11 +18,11 @@ class WebdavUploader:
         if os.path.getsize(filespec) > self.max_size:
             prefix = filespec+'.split.'
             print('File '+filespec+' too big, splitting in chunks...')
-            check_call(['split', '--bytes=' + str(self.split_size), filespec, prefix])
+            check_call(['split', '-b', str(self.split_size), filespec, prefix])
             dir = os.path.dirname(filespec)
             for file in os.listdir(dir):
-                print('Uploading chunk '+file)
-                if file.startswith(prefix):
+                if file.startswith(os.path.basename(prefix)):
+                    print('Uploading chunk '+file)
                     self.run_curl(os.path.join(dir, file))
         else:
             self.run_curl(filespec)
@@ -32,7 +32,7 @@ class WebdavUploader:
         for retries in range(5):
             if retries > 0: print("Retry %d of %d" % (retries, MAX_RETRY))
             try:
-                check_call(['curl', '--fail', '-X', 'PUT', '--progress-bar'] + [w for header in self.headers for w in ['--header', header]]
+                check_call(['curl', '--fail', '-X', 'PUT', '-o', '/dev/null', '--progress-bar'] + [w for header in self.headers for w in ['--header', header]]
                     + ['--data-binary', '@' + filespec, self.base_uri + os.path.basename(filespec)])
                 break
             except CalledProcessError as ex:

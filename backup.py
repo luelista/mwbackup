@@ -6,6 +6,7 @@ import sys, os, stat
 import tempfile
 from subprocess import call, check_call, Popen, PIPE
 import time
+import csv
 
 from webdavuploader import WebdavUploader
 from database import ManifestDb
@@ -20,7 +21,7 @@ def cmd_exclude():
         manifest.db.executemany("INSERT INTO excludes (exclude) VALUES (?)", [ (x,) for x in arg.a ])
         manifest.db.commit()
     if arg.l:
-        for fn in get_ignores():
+        for fn in manifest.get_ignores():
             print(fn)
 
 def addfile(filespec, backup_id):
@@ -44,7 +45,7 @@ def addfile(filespec, backup_id):
 
 def cmd_createbackup():
     if arg.c:
-        ignores = get_ignores()
+        ignores = manifest.get_ignores()
         backup_id = manifest.db.execute("insert into backups (ctime,folder) values (?,?)", (int(time.time()), backup_dir,)).lastrowid
         for dirpath,dirnames,filenames in os.walk(backup_dir):
             addfile(dirpath, backup_id)
@@ -69,73 +70,84 @@ def getfiles(backup_id, max_files, max_size):
     acc_size = 0
     files_count = 0
     for file in manifest.db.execute("SELECT files.rowid file_rowid,st_mode,filespec,st_size FROM files INNER JOIN backup_files ON file_rowid=file_id WHERE backup_id = ? AND archive_id IS NULL ORDER BY filespec LIMIT ?", (backup_id, max_files,)):
+        regfile = False
         if stat.S_ISREG(file[1]):
             acc_size += file[3]
             files_count += 1
+            regfile = True
         if acc_size > max_size and files_count > 1: break
         if arg.v >= 3: print('Yielding file ','#'+str(file[0]),file[2])
-        yield { 'file_rowid': file[0], 'filespec': file[2] }
-    
+        yield { 'file_rowid': file[0], 'filespec': file[2], 'regular': regfile }
+
 
 def getfilesize(backup_id, uploaded):
     if uploaded:
         cond = " NOT ( archive_id IS NULL ) "
     else:
         cond = " (archive_id IS NULL) "
-    return manifest.db.execute("""SELECT files.rowid file_rowid,SUM(st_size) FROM files 
-        INNER JOIN backup_files ON file_rowid=file_id 
+    size = manifest.db.execute("""SELECT files.rowid file_rowid,SUM(st_size) FROM files
+        INNER JOIN backup_files ON file_rowid=file_id
         WHERE backup_id = ? AND """ + cond, (backup_id,)).fetchone()[1]
+    if not size: return 0
+    return size
 
 
-def makearchive(backup_id, uploader, enc_password):
+def makearchive(backup_id, uploader, enc_password, max_size):
     print("Progress: %0.02f MB up, %0.02f MB to go" % (getfilesize(backup_id, True)/(1024*1024), getfilesize(backup_id, False)/(1024*1024)))
     atime = int(time.time())
     aformatteddate = time.strftime('%Y-%m-%d-%H%M%S')
     aname = '%s.tar.gz.aes' % (aformatteddate)
-    afilelistname = '%s.lst' % (aformatteddate)
     archive_id = manifest.db.execute("INSERT INTO archives (filename,ctime,backup_id) VALUES(?,?,?)", (aname, atime, backup_id,)).lastrowid
-    if arg.v >= 2: print("Compiling file list "+afilelistname, end=" "); sys.stdout.flush()
-    
+    if arg.v >= 2: print("Compiling file list "+aname, end=" "); sys.stdout.flush()
+
     strip_len = len(backup_dir)
     if strip_len != "/": strip_len += 1
     with tempfile.TemporaryDirectory() as dir, \
             open('/tmp/backup.log', 'a') as log:
         files_count = 0
-        afilelistpath = os.path.join(dir, afilelistname)
-        with open(afilelistpath, 'wb') as tmp:
-            for file in getfiles(backup_id, 2500, 450*1024*1024):
+        apathprefix = os.path.join(dir, aformatteddate)
+        with open(apathprefix+'.lst', 'wb') as tmp, open(apathprefix+'.csv', 'w') as csvfile:
+            csvout = csv.writer(csvfile, quoting=csv.QUOTE_ALL)
+            for file in getfiles(backup_id, 2500, max_size):
                 if arg.v >= 2: print (".", end=""); sys.stdout.flush()
                 tmp.write(bytes(file['filespec'][strip_len:], 'UTF-8'))
                 tmp.write(bytes([0]))
-                manifest.db.execute('UPDATE files SET archive_id=? WHERE rowid=?', (archive_id, file['file_rowid'],))
+                hash = ""
+                if file['regular']: hash = aescrypt.md5_file(file['filespec'])
+                manifest.db.execute('UPDATE files SET archive_id=?,hash=? WHERE rowid=?',
+                    (archive_id, hash, file['file_rowid'],))
+                csvout.writerow([hash, file['filespec'], archive_id, aname])
                 files_count += 1
         if arg.v >= 2: print ("\n",files_count," files")
         if files_count == 0: return False
-        
+
         if arg.v >= 2: print("Encrypting file list")
-        with open(afilelistpath, 'rb') as filelist, open(afilelistpath+'.aes', 'wb') as encfilelist:
+        with open(apathprefix+'.csv', 'rb') as filelist, open(apathprefix+'.csv.aes', 'wb') as encfilelist:
             aescrypt.encrypt(filelist, encfilelist, enc_password)
-        if arg.v >= 2: print("Uploading "+afilelistpath+'.aes'+"...")
-        uploader.uploadfile(afilelistpath+'.aes')
+        if arg.v >= 2: print("Uploading "+apathprefix+'.csv.aes'+"...")
+        uploader.uploadfile(apathprefix+'.csv.aes')
         if arg.v >= 2: print("OK")
-        
-        if arg.v >= 2: print("Building archive from file list ",tmp.name)
-        
+
+        if arg.v >= 2: print("Building archive from file list ",apathprefix+'.lst')
+
         apath = os.path.join(dir, aname)
         with open(apath, 'wb') as archive_file:
             tar = Popen(['tar', '--null', '-czf', '-', '-C', backup_dir, '-T', tmp.name, '--no-recursion'], stdout=PIPE, stderr=log)
             aescrypt.encrypt(tar.stdout, archive_file, enc_password)
         if arg.v >= 2: print("Uploading "+apath+"...")
         uploader.uploadfile(apath)
-        
+
+        hash = aescrypt.md5_file(apath)
+        manifest.db.execute("UPDATE archives set hash=? where rowid=?", (hash,archive_id,))
         manifest.db.commit()
         if arg.v >= 2: print("OK")
         return True
 
 def cmd_createarchives():
     uploader = WebdavUploader(manifest)
-    enc_password = get_config("encryption.password")
-    while makearchive(arg.b, uploader, enc_password):
+    enc_password = manifest.get_config("encryption.password")
+    max_size = int(manifest.get_config_or_default("archive.max_source_size", 450*1024*1024))
+    while makearchive(arg.b, uploader, enc_password, max_size):
         pass
 
 def cmd_config():
@@ -182,12 +194,6 @@ manifest_file = os.path.join(os.curdir, '.backup_manifest')
 if arg.manifest: manifest_file = arg.manifest
 
 manifest = ManifestDb(manifest_file)
-backup_dir = os.path.dirname(manifest_file)
+backup_dir = manifest.get_config_or_default("source", os.path.dirname(manifest_file))
 
 if 'func' in arg: arg.func()
-
-
-
-
-
-
