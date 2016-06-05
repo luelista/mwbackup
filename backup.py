@@ -11,6 +11,12 @@ import csv
 from webdavuploader import WebdavUploader
 from database import ManifestDb
 
+import logging
+logging.basicConfig(level=logging.DEBUG)
+log = logging.getLogger()
+fh = logging.FileHandler('backup_warnings.log')
+fh.setLevel(logging.WARN)
+log.addHandler(fh)
 
 def cmd_exclude():
     if arg.F:
@@ -53,7 +59,11 @@ def cmd_createbackup():
             for file in filenames:
                 if file in ignores: continue
                 filespec = os.path.join(dirpath, file)
-                addfile(filespec, backup_id)
+                try:
+                  addfile(filespec, backup_id)
+                except FileNotFoundError as ex:
+                  log.warning("ERR with file: %s", filespec)
+                  log.exception("%s", str(ex))
         manifest.db.commit()
     if arg.l:
         for b in manifest.db.execute("select rowid,* from backups").fetchall():
